@@ -30,7 +30,7 @@ I18N = {
         "verify_otp_btn": "인증 및 로그인",
         "otp_input_label": "패스코드 6자리 입력",
         "reenter_email_btn": "이메일 다시 입력하기",
-        "not_registered_err": "등록되지 않은 사용자입니다. 마케팅 관리자에게 문의하세요.",
+        "not_registered_err": "등록되지 않은 사용자입니다. 관리자에게 문의하세요.",
         "otp_sent_msg": "패스코드가 발송되었습니다. 이메일을 확인하세요.",
         "otp_expired_err": "패스코드 유효시간(5분)이 만료되었습니다.",
         "otp_mismatch_err": "패스코드가 일치하지 않습니다.",
@@ -166,11 +166,31 @@ except Exception:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# 사이드바 상단 언어 선택
+# 1. 사이드바 - 언어 선택
 selected_lang = st.sidebar.radio("🌐 Language / 언어 선택", ["한국어", "English"], index=0)
 L = I18N[selected_lang]
 
-# 1. 로그인 화면
+# 2. 사이드바 - 마케터 전용 사용자 관리 (로그인 전에도 접근 가능하도록 위치 변경)
+st.sidebar.markdown("---")
+with st.sidebar.expander(L["admin_header"]):
+    admin_key_input = st.text_input(L["admin_key_label"], type="password")
+    if admin_key_input == ADMIN_MASTER_KEY:
+        st.success(L["admin_auth_success"])
+        new_user_email = st.text_input(L["add_email_label"])
+        if st.button(L["add_user_btn"]):
+            if add_user_to_db(new_user_email): st.success("Success!")
+            else: st.error("Failed!")
+                
+        del_user_email = st.text_input(L["del_email_label"])
+        if st.button(L["del_user_btn"]):
+            if delete_user_from_db(del_user_email): st.success("Success!")
+            else: st.error("Failed!")
+                
+        st.markdown(f"**{L['user_list_label']}**")
+        for u in get_all_users():
+            st.text(f"- {u[0]}")
+
+# 3. 로그인 화면 처리
 def login_screen():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -222,7 +242,7 @@ if not st.session_state.get("authenticated", False):
     login_screen()
     st.stop()
 
-# 2. 사이드바 구성
+# 4. 로그인 성공 후 추가되는 사이드바 및 AI 설정
 st.sidebar.title(L["account_info"])
 st.sidebar.write(f"{L['current_user']}: **{st.session_state['user_email']}**")
 if st.sidebar.button(L["logout_btn"], use_container_width=True):
@@ -258,25 +278,6 @@ model = genai.GenerativeModel(
     generation_config=generation_config,
     system_instruction=L["system_instruction"]
 )
-
-st.sidebar.markdown("---")
-with st.sidebar.expander(L["admin_header"]):
-    admin_key_input = st.text_input(L["admin_key_label"], type="password")
-    if admin_key_input == ADMIN_MASTER_KEY:
-        st.success(L["admin_auth_success"])
-        new_user_email = st.text_input(L["add_email_label"])
-        if st.button(L["add_user_btn"]):
-            if add_user_to_db(new_user_email): st.success("Success!")
-            else: st.error("Failed!")
-                
-        del_user_email = st.text_input(L["del_email_label"])
-        if st.button(L["del_user_btn"]):
-            if delete_user_from_db(del_user_email): st.success("Success!")
-            else: st.error("Failed!")
-                
-        st.markdown(f"**{L['user_list_label']}**")
-        for u in get_all_users():
-            st.text(f"- {u[0]}")
 
 st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_model_name}** (Temp: {temperature_val})")
