@@ -105,9 +105,12 @@ try:
     raw_emails = st.secrets.get("ALLOWED_EMAILS", "")
     ALLOWED_USER_LIST = [e.strip() for e in raw_emails.split(",") if e.strip()]
     
+    # GCP 서비스 계정 정보 로드 및 private_key 줄바꿈 보정
     gcp_credentials = dict(st.secrets["gcp_service_account"])
+    if "private_key" in gcp_credentials:
+        gcp_credentials["private_key"] = gcp_credentials["private_key"].replace("\\n", "\n")
 except Exception as e:
-    st.error("시스템 설정(Secrets)이 올바르게 완료되지 않았습니다.")
+    st.error(f"시스템 설정(Secrets)이 올바르게 완료되지 않았습니다: {e}")
     st.stop()
 
 def is_registered_user(email: str) -> bool:
@@ -210,7 +213,6 @@ if st.sidebar.button(L["logout_btn"], use_container_width=True):
 st.sidebar.markdown("---")
 st.sidebar.header(L["ai_setting_header"])
 
-# 드롭다운에 실제 호출 가능한 모델명만 표시
 clean_model_names = [m.replace("models/", "") for m in VALID_MODELS]
 selected_model_idx = 0
 for idx, name in enumerate(clean_model_names):
@@ -240,7 +242,7 @@ generation_config = genai.GenerationConfig(
     max_output_tokens=8192
 )
 
-# 안전한 Gemini 콘텐츠 생성 래퍼 함수
+# 안전한 Gemini 콘텐츠 생성 래퍼 함수 (예외 시 대체 모델 순회)
 def safe_generate_content(prompt_text, preferred_model_name):
     target_models = [preferred_model_name] + [m for m in VALID_MODELS if m != preferred_model_name]
     last_error = None
@@ -263,21 +265,10 @@ def safe_generate_content(prompt_text, preferred_model_name):
 st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature_val})")
 
-# Google Drive API
-def parse_folder_id(input_str):
-    if "drive.google.com" in input_str:
-        match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
-        if match: return match.group(1)
-    return input_str.strip()
+# ========================================================
+# 동적 헤더 탐색 및 구글 드라이브 API 연동 파이프라인
+# ========================================================
 
-def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(
-        gcp_credentials,
-        scopes=['https://www.googleapis.com/auth/drive.readonly']
-    )
-    return build('drive', 'v3', credentials=creds)
-
-# 시트의 헤더를 찾는 기능 보강
 def find_and_set_header(df_raw):
     """
     상위 행들을 스캔하여 가장 적합한 헤더(열 이름) 행을 자동으로 탐색하여 지정하는 함수
@@ -287,8 +278,6 @@ def find_and_set_header(df_raw):
 
     best_header_idx = 0
     max_score = -1
-
-    # 상위 최대 15개 행 탐색
     search_limit = min(15, len(df_raw))
     
     for idx in range(search_limit):
@@ -297,23 +286,16 @@ def find_and_set_header(df_raw):
         if non_null_count == 0:
             continue
 
-        # 문자열(텍스트) 셀의 개수 가중치 계산
         str_count = sum(1 for val in row if isinstance(val, str) and str(val).strip() != '')
-        
-        # 헤더 점수 산출 (비어있지 않은 셀 수 + 텍스트 셀 비중)
         score = (non_null_count * 2) + (str_count * 3)
 
         if score > max_score:
             max_score = score
             best_header_idx = idx
 
-    # 최적의 헤더 행 추출
     header_row = df_raw.iloc[best_header_idx]
-    
-    # 헤더 이전 행(타이틀, 주석 등) 제거 및 헤더 이후 행만 실제 데이터로 사용
     df_clean = df_raw.iloc[best_header_idx + 1:].copy().reset_index(drop=True)
 
-    # 컬럼명 정제 (특수문자 제거 및 빈 컬럼 예외 처리)
     new_cols = []
     for i, val in enumerate(header_row):
         if pd.notnull(val) and str(val).strip() != '':
@@ -324,7 +306,6 @@ def find_and_set_header(df_raw):
             clean_val = f"col_{i+1}"
         new_cols.append(clean_val)
 
-    # 중복 컬럼명 방지 (예: col_1, col_1_1)
     seen = {}
     unique_cols = []
     for col in new_cols:
@@ -338,35 +319,54 @@ def find_and_set_header(df_raw):
     df_clean.columns = unique_cols
     return df_clean
 
+def parse_folder_id(input_str):
+    if "drive.google.com" in input_str:
+        match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
+        if match: return match.group(1)
+    return input_str.strip()
+
+def get_drive_service():
+    creds = service_account.Credentials.from_service_account_info(
+        gcp_credentials,
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    return build('drive', 'v3', credentials=creds)
+
 # [파이프라인 1] 다중 시트 및 복수 탭(Worksheet) 동기화 파이프라인
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
-    query = f"'{folder_id.strip()}' in parents and trashed = false"
+    clean_folder_id = parse_folder_id(folder_id)
+    query = f"'{clean_folder_id}' in parents and trashed = false"
     
-    results = drive_service.files().list(
-        q=query,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        fields="files(id, name, mimeType)"
-    ).execute()
-    files = results.get('files', [])
+    try:
+        results = drive_service.files().list(
+            q=query,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            fields="files(id, name, mimeType)"
+        ).execute()
+        files = results.get('files', [])
+    except Exception as list_err:
+        raise Exception(f"구글 드라이브 폴더 조회 실패 (폴더 ID 및 서비스 계정 권한 확인 필요): {list_err}")
+
+    if not files:
+        raise Exception(f"지정한 폴더(ID: {clean_folder_id}) 내에 접근 가능한 파일이 없습니다. 서비스 계정이 해당 폴더에 '뷰어'로 추가되어 있는지 확인하세요.")
 
     conn = sqlite3.connect(':memory:')
     loaded_tables = []
     table_index = 1
+    fetch_errors = []
 
     for f in files:
         file_id = f['id']
         file_name = f['name']
         mime_type = f['mimeType']
-        
-        # 파일명 정제 (파일명에서 특수문자 제거)
         file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
 
         try:
             fh = io.BytesIO()
 
-            # 1. 순수 구글 시트 (Google Sheets 웹문서): 모든 탭 포함을 위해 XLSX로 내보내기
+            # 1. 순수 구글 시트 (Google Sheets 웹문서): 모든 탭을 파싱하기 위해 XLSX로 내보내기
             if mime_type == 'application/vnd.google-apps.spreadsheet':
                 export_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
@@ -375,11 +375,9 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 while not done:
                     _, done = downloader.next_chunk()
                 fh.seek(0)
-                
-                # sheet_name=None 으로 설정하여 파일 내 모든 탭을 {탭이름: DF} 다이렉터리로 로드
                 sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
 
-            # 2. PC에서 업로드된 엑셀 파일 (.xlsx, .xls)
+            # 2. 업로드된 엑셀 파일 (.xlsx, .xls)
             elif file_name.lower().endswith(('.xlsx', '.xls')) or 'excel' in mime_type:
                 request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
                 downloader = MediaIoBaseDownload(fh, request)
@@ -387,10 +385,9 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 while not done:
                     _, done = downloader.next_chunk()
                 fh.seek(0)
-                
                 sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
 
-            # 3. PC에서 업로드된 단일 CSV 파일 (.csv)
+            # 3. 업로드된 CSV 파일 (.csv)
             elif file_name.lower().endswith('.csv') or mime_type == 'text/csv':
                 request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
                 downloader = MediaIoBaseDownload(fh, request)
@@ -398,33 +395,26 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 while not done:
                     _, done = downloader.next_chunk()
                 fh.seek(0)
-                
                 sheets_dict = {"Main": pd.read_csv(fh, header=None)}
-
             else:
                 continue
 
-            # 파일 내 모든 탭을 순회하며 DB에 개별 테이블로 로드
             for tab_name, df_raw in sheets_dict.items():
                 if df_raw.empty:
                     continue
 
-                # 탭 이름 정제
                 tab_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(tab_name))
                 table_name = f"data_{table_index}_{file_name_clean[:12]}_{tab_name_clean[:10]}"
 
-                # 탭별 헤더 자동 탐색 및 정제
                 df = find_and_set_header(df_raw)
 
                 if df.empty or len(df.columns) == 0:
                     continue
 
-                # SQLite 메모리 DB에 탭 데이터를 테이블로 저장
                 df.to_sql(table_name, conn, index=False, if_exists='replace')
                 cols = ", ".join(df.columns.tolist())
-                
-                # AI 프롬프트에 전달할 탭 데이터 샘플 2행 추출
                 sample_data = df.head(2).to_dict(orient='records')
+                
                 loaded_tables.append(
                     f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
                     f"  Columns: {cols}\n"
@@ -432,11 +422,15 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 )
                 table_index += 1
 
-        except Exception as e:
+        except Exception as file_err:
+            fetch_errors.append(f"[{file_name}] 읽기 실패: {file_err}")
             continue
 
+    if fetch_errors:
+        st.warning("⚠️ 일부 파일 로딩 중 오류 발생:\n" + "\n".join(fetch_errors))
+
     if not loaded_tables:
-        raise Exception("구글드라이브 폴더에서 구글 시트 데이터를 읽어오지 못했습니다.")
+        raise Exception("구글 드라이브 내 구글 시트 파일에서 유효한 데이터 테이블을 추출하지 못했습니다.")
 
     schema_info = "\n\n".join(loaded_tables)
     sql_prompt = f"""
@@ -457,15 +451,19 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
 # [파이프라인 2] 문서 동기화 및 텍스트 추출
 def fetch_and_extract_multi_docs(folder_id, user_prompt):
     drive_service = get_drive_service()
-    query = f"'{folder_id.strip()}' in parents and trashed = false"
+    clean_folder_id = parse_folder_id(folder_id)
+    query = f"'{clean_folder_id}' in parents and trashed = false"
     
-    results = drive_service.files().list(
-        q=query,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        fields="files(id, name, mimeType)"
-    ).execute()
-    files = results.get('files', [])
+    try:
+        results = drive_service.files().list(
+            q=query,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            fields="files(id, name, mimeType)"
+        ).execute()
+        files = results.get('files', [])
+    except Exception:
+        return "문서 폴더 접근 권한을 확인하세요."
 
     combined_text = ""
 
