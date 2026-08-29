@@ -277,7 +277,68 @@ def get_drive_service():
     )
     return build('drive', 'v3', credentials=creds)
 
-# [파이프라인 1] 다중 시트 동기화 및 SQL 추출
+# 시트의 헤더를 찾는 기능 보강
+def find_and_set_header(df_raw):
+    """
+    상위 행들을 스캔하여 가장 적합한 헤더(열 이름) 행을 자동으로 탐색하여 지정하는 함수
+    """
+    if df_raw.empty:
+        return df_raw
+
+    best_header_idx = 0
+    max_score = -1
+
+    # 상위 최대 15개 행 탐색
+    search_limit = min(15, len(df_raw))
+    
+    for idx in range(search_limit):
+        row = df_raw.iloc[idx]
+        non_null_count = row.notnull().sum()
+        if non_null_count == 0:
+            continue
+
+        # 문자열(텍스트) 셀의 개수 가중치 계산
+        str_count = sum(1 for val in row if isinstance(val, str) and str(val).strip() != '')
+        
+        # 헤더 점수 산출 (비어있지 않은 셀 수 + 텍스트 셀 비중)
+        score = (non_null_count * 2) + (str_count * 3)
+
+        if score > max_score:
+            max_score = score
+            best_header_idx = idx
+
+    # 최적의 헤더 행 추출
+    header_row = df_raw.iloc[best_header_idx]
+    
+    # 헤더 이전 행(타이틀, 주석 등) 제거 및 헤더 이후 행만 실제 데이터로 사용
+    df_clean = df_raw.iloc[best_header_idx + 1:].copy().reset_index(drop=True)
+
+    # 컬럼명 정제 (특수문자 제거 및 빈 컬럼 예외 처리)
+    new_cols = []
+    for i, val in enumerate(header_row):
+        if pd.notnull(val) and str(val).strip() != '':
+            clean_val = re.sub(r'[^a-zA-Z0-9가-힣]', '_', str(val).strip()).strip('_')
+            if not clean_val:
+                clean_val = f"col_{i+1}"
+        else:
+            clean_val = f"col_{i+1}"
+        new_cols.append(clean_val)
+
+    # 중복 컬럼명 방지 (예: col_1, col_1_1)
+    seen = {}
+    unique_cols = []
+    for col in new_cols:
+        if col in seen:
+            seen[col] += 1
+            unique_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            unique_cols.append(col)
+
+    df_clean.columns = unique_cols
+    return df_clean
+
+# [파이프라인 1] 다중 시트 동기화 및 SQL 추출 (자동 헤더 탐색 기능 탑재)
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     query = f"'{folder_id.strip()}' in parents and trashed = false"
@@ -316,14 +377,28 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 _, done = downloader.next_chunk()
             fh.seek(0)
             
+            # 헤더 없이(header=None) 파일 원본 전체를 데이터프레임으로 로드
             if file_name.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(fh)
+                df_raw = pd.read_excel(fh, header=None)
             else:
-                df = pd.read_csv(fh)
+                df_raw = pd.read_csv(fh, header=None)
+
+            # 자동 헤더 탐색 및 정제 적용
+            df = find_and_set_header(df_raw)
+
+            if df.empty or len(df.columns) == 0:
+                continue
 
             df.to_sql(table_name, conn, index=False, if_exists='replace')
             cols = ", ".join(df.columns.tolist())
-            loaded_tables.append(f"- Table [{table_name}] (File: {file_name}) / Columns: {cols}")
+            
+            # 실제 데이터 샘플 2행을 프롬프트에 제공하여 Text-to-SQL 정밀도 향상
+            sample_data = df.head(2).to_dict(orient='records')
+            loaded_tables.append(
+                f"- Table [{table_name}] (File: {file_name})\n"
+                f"  Columns: {cols}\n"
+                f"  Sample Data: {sample_data}"
+            )
             table_index += 1
         except Exception:
             continue
@@ -331,11 +406,12 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     if not loaded_tables:
         raise Exception("Google Drive folder is empty or files could not be read.")
 
-    schema_info = "\n".join(loaded_tables)
+    schema_info = "\n\n".join(loaded_tables)
     sql_prompt = f"""
-    As an SQLite expert, generate ONLY a valid SQL query based on the table schema below to answer the user request.
+    As an SQLite expert, generate ONLY a valid SQL query based on the table schema and sample data below to answer the user request.
+    Do NOT include markdown formatting like ```sql or explanations. Return pure SQL text only.
     
-    [Schema]
+    [Schema & Sample Data]
     {schema_info}
     
     Request: {user_prompt}
