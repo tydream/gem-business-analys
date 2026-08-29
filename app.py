@@ -2,10 +2,7 @@ import os
 import io
 import re
 import time
-import shutil
 import sqlite3
-import requests
-import gdown
 import pandas as pd
 import streamlit as st
 import google.generativeai as genai
@@ -13,6 +10,11 @@ from duckduckgo_search import DDGS
 from pypdf import PdfReader
 import docx
 from email_auth import generate_otp, send_otp_email
+
+# 구글 API 연동 패키지
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 DB_FILE = "users.db"
 OTP_EXPIRATION_SECONDS = 300
@@ -30,7 +32,7 @@ I18N = {
         "verify_otp_btn": "인증 및 로그인",
         "otp_input_label": "패스코드 6자리 입력",
         "reenter_email_btn": "이메일 다시 입력하기",
-        "not_registered_err": "등록되지 않은 사용자입니다. 관리자에게 문의하세요.",
+        "not_registered_err": "등록되지 않은 사용자입니다. 마케팅 관리자에게 문의하세요.",
         "otp_sent_msg": "패스코드가 발송되었습니다. 이메일을 확인하세요.",
         "otp_expired_err": "패스코드 유효시간(5분)이 만료되었습니다.",
         "otp_mismatch_err": "패스코드가 일치하지 않습니다.",
@@ -52,8 +54,8 @@ I18N = {
         "app_caption": "현재 선택된 AI 모델",
         "input_placeholder": "분석 질문을 입력하세요 (예: 2025~2026년 8월 한국, 중국, 일본의 모델별 실판매 수량 비교표와 핵심 이슈를 종합 보고서로 작성해 줘)",
         "status_start": "통합 데이터 파이프라인 가동 중...",
-        "status_step1": "📊 1/3. 다중 시트 데이터 동기화 및 SQL 추출 중...",
-        "status_step2": "📁 2/3. 비즈니스 문서(Docs, PDF, TXT, MD) 파싱 및 분석 중...",
+        "status_step1": "📊 1/3. 구글드라이브 시트 데이터 동기화 및 SQL 추출 중...",
+        "status_step2": "📁 2/3. 구글드라이브 비즈니스 문서 파싱 및 분석 중...",
         "status_step3": "🌐 3/3. 외부 시장 동향 웹 검색 수행 중...",
         "status_complete": "데이터 수집 완료! 종합 보고서 작성 중...",
         "download_btn": "📄 마크다운 보고서 다운로드 (.md)",
@@ -91,8 +93,8 @@ I18N = {
         "app_caption": "Active AI Model",
         "input_placeholder": "Enter analysis query (e.g., Create a sales performance table and key issue report for Korea, China, and Japan by model from 2025 to Aug 2026)",
         "status_start": "Running integrated data pipeline...",
-        "status_step1": "📊 1/3. Syncing multi-sheets & executing SQL...",
-        "status_step2": "📁 2/3. Parsing & analyzing business documents (Docs, PDF, TXT, MD)...",
+        "status_step1": "📊 1/3. Syncing Drive sheets & executing SQL...",
+        "status_step2": "📁 2/3. Parsing & analyzing Drive documents...",
         "status_step3": "🌐 3/3. Performing external web search...",
         "status_complete": "Data collection complete! Generating comprehensive report...",
         "download_btn": "📄 Download Markdown Report (.md)",
@@ -101,7 +103,7 @@ I18N = {
     }
 }
 
-# SQLite 데이터베이스 초기화
+# SQLite 초기화 및 사용자 관리
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -116,7 +118,6 @@ def init_db():
 
 init_db()
 
-# DB 사용자 관리
 def is_registered_user(email: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -160,7 +161,10 @@ try:
     DOCS_FOLDER_ID = st.secrets["DOCS_FOLDER_ID"]
     RESEND_API_KEY = st.secrets["RESEND_API_KEY"]
     ADMIN_MASTER_KEY = st.secrets["ADMIN_MASTER_KEY"]
-except Exception:
+    
+    # GCP 서비스 계정 정보 로드
+    gcp_credentials = dict(st.secrets["gcp_service_account"])
+except Exception as e:
     st.error("시스템 설정(Secrets)이 올바르게 완료되지 않았습니다.")
     st.stop()
 
@@ -170,7 +174,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 selected_lang = st.sidebar.radio("🌐 Language / 언어 선택", ["한국어", "English"], index=0)
 L = I18N[selected_lang]
 
-# 2. 사이드바 - 마케터 전용 사용자 관리 (로그인 전에도 접근 가능하도록 위치 변경)
+# 2. 사이드바 - 마케터 전용 사용자 관리
 st.sidebar.markdown("---")
 with st.sidebar.expander(L["admin_header"]):
     admin_key_input = st.text_input(L["admin_key_label"], type="password")
@@ -217,7 +221,7 @@ def login_screen():
                             st.success(L["otp_sent_msg"])
                             st.rerun()
                         else:
-                            st.error(f"Email delivery failed. (Check Resend API Key or recipient email restriction)")
+                            st.error("Email delivery failed.")
         else:
             st.info(f"**{st.session_state['target_email']}**")
             with st.form("verify_otp"):
@@ -282,49 +286,71 @@ model = genai.GenerativeModel(
 st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_model_name}** (Temp: {temperature_val})")
 
-def parse_folder_id(input_str):
-    if "drive.google.com" in input_str:
-        match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
-        if match: return match.group(1)
-    return input_str.strip()
+# ========================================================
+# Google Drive API (서비스 계정 연동 파이프라인)
+# ========================================================
+
+def get_drive_service():
+    creds = service_account.Credentials.from_service_account_info(
+        gcp_credentials,
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    return build('drive', 'v3', credentials=creds)
 
 # [파이프라인 1] 다중 시트 동기화 및 SQL 추출
-def fetch_and_load_multiple_sheets(folder_input, user_prompt):
-    folder_id = parse_folder_id(folder_input)
-    temp_dir = "./temp_sheets"
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
+def fetch_and_load_multiple_sheets(folder_id, user_prompt):
+    drive_service = get_drive_service()
+    query = f"'{folder_id.strip()}' in parents and trashed = false"
     
-    gdrive_url = f"https://drive.google.com/drive/folders/{folder_id}"
-    gdown.download_folder(url=gdrive_url, output=temp_dir, quiet=True, use_cookies=False)
-    
+    # 공유드라이브를 위한 API 옵션 설정
+    results = drive_service.files().list(
+        q=query,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        fields="files(id, name, mimeType)"
+    ).execute()
+    files = results.get('files', [])
+
     conn = sqlite3.connect(':memory:')
     loaded_tables = []
     table_index = 1
-    
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            file_path = os.path.join(root, file)
-            file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file)[0])
-            table_name = f"data_{table_index}_{file_name_clean[:20]}"
-            
-            try:
-                if file.endswith('.csv'):
-                    df = pd.read_csv(file_path)
-                elif file.endswith(('.xlsx', '.xls')):
-                    df = pd.read_excel(file_path)
-                else:
-                    continue
-                    
-                df.to_sql(table_name, conn, index=False, if_exists='replace')
-                cols = ", ".join(df.columns.tolist())
-                loaded_tables.append(f"- Table [{table_name}] (File: {file}) / Columns: {cols}")
-                table_index += 1
-            except Exception:
+
+    for f in files:
+        file_id = f['id']
+        file_name = f['name']
+        mime_type = f['mimeType']
+        file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
+        table_name = f"data_{table_index}_{file_name_clean[:20]}"
+
+        try:
+            if mime_type == 'application/vnd.google-apps.spreadsheet':
+                request = drive_service.files().export_media(fileId=file_id, mimeType='text/csv')
+            elif file_name.endswith(('.csv', '.xlsx', '.xls')):
+                request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+            else:
                 continue
 
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            fh.seek(0)
+            
+            if file_name.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(fh)
+            else:
+                df = pd.read_csv(fh)
+
+            df.to_sql(table_name, conn, index=False, if_exists='replace')
+            cols = ", ".join(df.columns.tolist())
+            loaded_tables.append(f"- Table [{table_name}] (File: {file_name}) / Columns: {cols}")
+            table_index += 1
+        except Exception:
+            continue
+
     if not loaded_tables:
-        raise Exception("No valid sheet files found in Google Drive.")
+        raise Exception("Google Drive folder is empty or files could not be read. Ensure service account has viewer access.")
 
     schema_info = "\n".join(loaded_tables)
     sql_prompt = f"""
@@ -342,37 +368,54 @@ def fetch_and_load_multiple_sheets(folder_input, user_prompt):
     return clean_sql, result_df.to_markdown(index=False)
 
 # [파이프라인 2] 문서 동기화 및 텍스트 추출
-def fetch_and_extract_multi_docs(folder_input, user_prompt):
-    folder_id = parse_folder_id(folder_input)
-    temp_dir = "./temp_docs"
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
+def fetch_and_extract_multi_docs(folder_id, user_prompt):
+    drive_service = get_drive_service()
+    query = f"'{folder_id.strip()}' in parents and trashed = false"
     
-    gdrive_url = f"https://drive.google.com/drive/folders/{folder_id}"
-    gdown.download_folder(url=gdrive_url, output=temp_dir, quiet=True, use_cookies=False)
+    results = drive_service.files().list(
+        q=query,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        fields="files(id, name, mimeType)"
+    ).execute()
+    files = results.get('files', [])
 
     combined_text = ""
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            path = os.path.join(root, file)
-            ext = os.path.splitext(file)[1].lower()
-            file_content = ""
-            try:
-                if ext in ['.md', '.txt']:
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        file_content = f.read()
-                elif ext == '.pdf':
-                    reader = PdfReader(path)
-                    for page in reader.pages:
-                        file_content += page.extract_text() + "\n"
-                elif ext in ['.docx', '.doc']:
-                    doc = docx.Document(path)
-                    file_content = "\n".join([p.text for p in doc.paragraphs])
-            except Exception:
-                continue
 
-            if file_content.strip():
-                combined_text += f"\n--- [Document: {file}] ---\n" + file_content
+    for f in files:
+        file_id = f['id']
+        file_name = f['name']
+        mime_type = f['mimeType']
+        ext = os.path.splitext(file_name)[1].lower()
+
+        file_content = ""
+        try:
+            if mime_type == 'application/vnd.google-apps.document':
+                request = drive_service.files().export_media(fileId=file_id, mimeType='text/plain')
+            else:
+                request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            fh.seek(0)
+
+            if mime_type == 'application/vnd.google-apps.document' or ext in ['.md', '.txt']:
+                file_content = fh.getvalue().decode('utf-8', errors='ignore')
+            elif ext == '.pdf':
+                reader = PdfReader(fh)
+                for page in reader.pages:
+                    file_content += page.extract_text() + "\n"
+            elif ext in ['.docx', '.doc']:
+                doc = docx.Document(fh)
+                file_content = "\n".join([p.text for p in doc.paragraphs])
+        except Exception:
+            continue
+
+        if file_content.strip():
+            combined_text += f"\n--- [Document: {file_name}] ---\n" + file_content
 
     if not combined_text:
         return "No business documents found."
