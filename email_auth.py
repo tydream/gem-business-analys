@@ -4,7 +4,7 @@ import resend
 def generate_otp() -> str:
     return str(random.randint(100000, 999999))
 
-def send_otp_email(resend_api_key: str, receiver_email: str, otp_code: str) -> bool:
+def send_otp_email(resend_api_key: str, receiver_email: str, otp_code: str) -> tuple[bool, str]:
     try:
         resend.api_key = resend_api_key
         resend.Emails.send({
@@ -18,7 +18,6 @@ def send_otp_email(resend_api_key: str, receiver_email: str, otp_code: str) -> b
             <p>- 해당 패스코드는 5분간 유효합니다.</p>
             """
         })
-        return True
+        return True, "성공"
     except Exception as e:
-        print(f"메일 발송 오류: {e}")
-        return False
+        return False, str(e)
