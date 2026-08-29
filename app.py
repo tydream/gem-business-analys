@@ -338,7 +338,7 @@ def find_and_set_header(df_raw):
     df_clean.columns = unique_cols
     return df_clean
 
-# [파이프라인 1] 다중 시트 동기화 및 SQL 추출 (자동 헤더 탐색 기능 탑재)
+# [파이프라인 1] 다중 시트 및 복수 탭(Worksheet) 동기화 파이프라인
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     query = f"'{folder_id.strip()}' in parents and trashed = false"
@@ -359,52 +359,84 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         file_id = f['id']
         file_name = f['name']
         mime_type = f['mimeType']
+        
+        # 파일명 정제 (파일명에서 특수문자 제거)
         file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
-        table_name = f"data_{table_index}_{file_name_clean[:20]}"
 
         try:
-            if mime_type == 'application/vnd.google-apps.spreadsheet':
-                request = drive_service.files().export_media(fileId=file_id, mimeType='text/csv')
-            elif file_name.endswith(('.csv', '.xlsx', '.xls')):
-                request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
-            else:
-                continue
-
             fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            fh.seek(0)
-            
-            # 헤더 없이(header=None) 파일 원본 전체를 데이터프레임으로 로드
-            if file_name.endswith(('.xlsx', '.xls')):
-                df_raw = pd.read_excel(fh, header=None)
+
+            # 1. 순수 구글 시트 (Google Sheets 웹문서): 모든 탭 포함을 위해 XLSX로 내보내기
+            if mime_type == 'application/vnd.google-apps.spreadsheet':
+                export_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                fh.seek(0)
+                
+                # sheet_name=None 으로 설정하여 파일 내 모든 탭을 {탭이름: DF} 다이렉터리로 로드
+                sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
+
+            # 2. PC에서 업로드된 엑셀 파일 (.xlsx, .xls)
+            elif file_name.lower().endswith(('.xlsx', '.xls')) or 'excel' in mime_type:
+                request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                fh.seek(0)
+                
+                sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
+
+            # 3. PC에서 업로드된 단일 CSV 파일 (.csv)
+            elif file_name.lower().endswith('.csv') or mime_type == 'text/csv':
+                request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                fh.seek(0)
+                
+                sheets_dict = {"Main": pd.read_csv(fh, header=None)}
+
             else:
-                df_raw = pd.read_csv(fh, header=None)
-
-            # 자동 헤더 탐색 및 정제 적용
-            df = find_and_set_header(df_raw)
-
-            if df.empty or len(df.columns) == 0:
                 continue
 
-            df.to_sql(table_name, conn, index=False, if_exists='replace')
-            cols = ", ".join(df.columns.tolist())
-            
-            # 실제 데이터 샘플 2행을 프롬프트에 제공하여 Text-to-SQL 정밀도 향상
-            sample_data = df.head(2).to_dict(orient='records')
-            loaded_tables.append(
-                f"- Table [{table_name}] (File: {file_name})\n"
-                f"  Columns: {cols}\n"
-                f"  Sample Data: {sample_data}"
-            )
-            table_index += 1
-        except Exception:
+            # 파일 내 모든 탭을 순회하며 DB에 개별 테이블로 로드
+            for tab_name, df_raw in sheets_dict.items():
+                if df_raw.empty:
+                    continue
+
+                # 탭 이름 정제
+                tab_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(tab_name))
+                table_name = f"data_{table_index}_{file_name_clean[:12]}_{tab_name_clean[:10]}"
+
+                # 탭별 헤더 자동 탐색 및 정제
+                df = find_and_set_header(df_raw)
+
+                if df.empty or len(df.columns) == 0:
+                    continue
+
+                # SQLite 메모리 DB에 탭 데이터를 테이블로 저장
+                df.to_sql(table_name, conn, index=False, if_exists='replace')
+                cols = ", ".join(df.columns.tolist())
+                
+                # AI 프롬프트에 전달할 탭 데이터 샘플 2행 추출
+                sample_data = df.head(2).to_dict(orient='records')
+                loaded_tables.append(
+                    f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
+                    f"  Columns: {cols}\n"
+                    f"  Sample Data: {sample_data}"
+                )
+                table_index += 1
+
+        except Exception as e:
             continue
 
     if not loaded_tables:
-        raise Exception("Google Drive folder is empty or files could not be read.")
+        raise Exception("구글드라이브 폴더에서 구글 시트 데이터를 읽어오지 못했습니다.")
 
     schema_info = "\n\n".join(loaded_tables)
     sql_prompt = f"""
