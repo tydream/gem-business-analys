@@ -2,6 +2,7 @@ import os
 import io
 import re
 import time
+import sqlite3
 import pandas as pd
 import streamlit as st
 import google.generativeai as genai
@@ -30,7 +31,7 @@ I18N = {
         "verify_otp_btn": "인증 및 로그인",
         "otp_input_label": "패스코드 6자리 입력",
         "reenter_email_btn": "이메일 다시 입력하기",
-        "not_registered_err": "등록되지 않은 사용자입니다. (관리자에게 Secrets 등록을 요청하세요)",
+        "not_registered_err": "등록되지 않은 사용자입니다. (Secrets의 ALLOWED_EMAILS 설정을 확인하세요)",
         "otp_sent_msg": "패스코드가 발송되었습니다. 이메일을 확인하세요.",
         "otp_expired_err": "패스코드 유효시간(5분)이 만료되었습니다.",
         "otp_mismatch_err": "패스코드가 일치하지 않습니다.",
@@ -65,7 +66,7 @@ I18N = {
         "verify_otp_btn": "Verify & Login",
         "otp_input_label": "Enter 6-digit Passcode",
         "reenter_email_btn": "Re-enter Email",
-        "not_registered_err": "Unregistered user. Please ask the admin to add you in Secrets.",
+        "not_registered_err": "Unregistered user. Please check ALLOWED_EMAILS in Secrets.",
         "otp_sent_msg": "Passcode sent. Please check your email inbox.",
         "otp_expired_err": "Passcode has expired (5-minute limit).",
         "otp_mismatch_err": "Passcode does not match.",
@@ -101,27 +102,39 @@ try:
     RESEND_API_KEY = st.secrets["RESEND_API_KEY"]
     ADMIN_MASTER_KEY = st.secrets["ADMIN_MASTER_KEY"]
     
-    # Secrets에서 ALLOWED_EMAILS를 가져와 리스트로 변환 (공백 제거)
     raw_emails = st.secrets.get("ALLOWED_EMAILS", "")
     ALLOWED_USER_LIST = [e.strip() for e in raw_emails.split(",") if e.strip()]
     
-    # GCP 서비스 계정 정보 로드
     gcp_credentials = dict(st.secrets["gcp_service_account"])
 except Exception as e:
     st.error("시스템 설정(Secrets)이 올바르게 완료되지 않았습니다.")
     st.stop()
 
-# 등록된 사용자인지 Secrets를 기준으로 검사
 def is_registered_user(email: str) -> bool:
     return email.strip() in ALLOWED_USER_LIST
 
+# Gemini API 설정 및 사용 가능한 모델 동적 검색
 genai.configure(api_key=GEMINI_API_KEY)
+
+def get_valid_model_list():
+    try:
+        models = [
+            m.name for m in genai.list_models()
+            if "generateContent" in m.supported_generation_methods
+        ]
+        if models:
+            return models
+    except Exception:
+        pass
+    return ["models/gemini-1.5-flash", "models/gemini-1.5-pro", "models/gemini-2.0-flash"]
+
+VALID_MODELS = get_valid_model_list()
 
 # 1. 사이드바 - 언어 선택
 selected_lang = st.sidebar.radio("🌐 Language / 언어 선택", ["한국어", "English"], index=0)
 L = I18N[selected_lang]
 
-# 2. 사이드바 - 마케터 전용 사용자 관리 (Secrets에 등록된 영구 명단 확인용)
+# 2. 사이드바 - 마케터 전용 사용자 관리
 st.sidebar.markdown("---")
 with st.sidebar.expander(L["admin_header"]):
     admin_key_input = st.text_input(L["admin_key_label"], type="password")
@@ -133,8 +146,6 @@ with st.sidebar.expander(L["admin_header"]):
                 st.text(f"- {u}")
         else:
             st.text("등록된 사용자가 없습니다. Secrets에 ALLOWED_EMAILS를 추가하세요.")
-        
-        st.info("💡 사용자를 추가/삭제하려면 Streamlit Cloud의 [Settings] -> [Secrets] 메뉴에서 ALLOWED_EMAILS 항목을 수정하세요.")
 
 # 3. 로그인 화면 처리
 def login_screen():
@@ -199,23 +210,20 @@ if st.sidebar.button(L["logout_btn"], use_container_width=True):
 st.sidebar.markdown("---")
 st.sidebar.header(L["ai_setting_header"])
 
-# 현재 API 키로 사용 가능한 모델 목록 동적 조회
-try:
-    available_models = [
-        m.name.replace("models/", "") 
-        for m in genai.list_models() 
-        if "generateContent" in m.supported_generation_methods
-    ]
-    if not available_models:
-        available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
-except Exception:
-    available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+# 드롭다운에 실제 호출 가능한 모델명만 표시
+clean_model_names = [m.replace("models/", "") for m in VALID_MODELS]
+selected_model_idx = 0
+for idx, name in enumerate(clean_model_names):
+    if "1.5-flash" in name or "2.0-flash" in name:
+        selected_model_idx = idx
+        break
 
-selected_model_name = st.sidebar.selectbox(
+selected_display_name = st.sidebar.selectbox(
     L["model_select_label"],
-    available_models,
-    index=0
+    clean_model_names,
+    index=selected_model_idx
 )
+selected_model_fullname = f"models/{selected_display_name}" if not selected_display_name.startswith("models/") else selected_display_name
 
 temperature_val = st.sidebar.slider(
     L["temp_slider_label"],
@@ -232,19 +240,30 @@ generation_config = genai.GenerationConfig(
     max_output_tokens=8192
 )
 
-model = genai.GenerativeModel(
-    model_name=selected_model_name,
-    generation_config=generation_config,
-    system_instruction=L["system_instruction"]
-)
+# 안전한 Gemini 콘텐츠 생성 래퍼 함수
+def safe_generate_content(prompt_text, preferred_model_name):
+    target_models = [preferred_model_name] + [m for m in VALID_MODELS if m != preferred_model_name]
+    last_error = None
+
+    for m_name in target_models:
+        try:
+            m_obj = genai.GenerativeModel(
+                model_name=m_name,
+                generation_config=generation_config,
+                system_instruction=L["system_instruction"]
+            )
+            res = m_obj.generate_content(prompt_text)
+            if res and res.text:
+                return res.text
+        except Exception as ex:
+            last_error = ex
+            continue
+    raise Exception(f"Gemini API 호출 실패 (모든 모델 연결 불가): {last_error}")
 
 st.title(L["page_title"])
-st.caption(f"{L['app_caption']}: **{selected_model_name}** (Temp: {temperature_val})")
+st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature_val})")
 
-# ========================================================
-# Google Drive API (서비스 계정 연동 파이프라인)
-# ========================================================
-
+# Google Drive API
 def parse_folder_id(input_str):
     if "drive.google.com" in input_str:
         match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
@@ -310,7 +329,7 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
             continue
 
     if not loaded_tables:
-        raise Exception("Google Drive folder is empty or files could not be read. Ensure service account has viewer access.")
+        raise Exception("Google Drive folder is empty or files could not be read.")
 
     schema_info = "\n".join(loaded_tables)
     sql_prompt = f"""
@@ -321,7 +340,7 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     
     Request: {user_prompt}
     """
-    sql_res = model.generate_content(sql_prompt).text.strip()
+    sql_res = safe_generate_content(sql_prompt, selected_model_fullname).strip()
     clean_sql = sql_res.replace("```sql", "").replace("```", "").strip()
     
     result_df = pd.read_sql_query(clean_sql, conn)
@@ -388,7 +407,7 @@ def fetch_and_extract_multi_docs(folder_id, user_prompt):
     
     Request: {user_prompt}
     """
-    return model.generate_content(extract_prompt).text
+    return safe_generate_content(extract_prompt, selected_model_fullname)
 
 # [파이프라인 3] 웹 검색
 def perform_web_search(query):
@@ -429,7 +448,6 @@ if prompt := st.chat_input(L["input_placeholder"]):
 
         status.update(label=L["status_complete"], state="complete", expanded=False)
 
-        # 보고서 생성 및 자동 에러 복구 로직
         report_prompt = f"""
         {L['report_prompt_directive']}
 
@@ -444,22 +462,18 @@ if prompt := st.chat_input(L["input_placeholder"]):
 
         User Request: {prompt}
         """
-
+        
         try:
-            report_md = model.generate_content(report_prompt).text
-        except Exception as e:
-            # 설정한 모델 호출 실패 시 지원 가능한 첫 번째 모델로 자동 전환
-            fallback_name = available_models[0] if available_models else "gemini-1.5-flash"
-            fallback_model = genai.GenerativeModel(fallback_name)
-            report_md = fallback_model.generate_content(report_prompt).text
+            report_md = safe_generate_content(report_prompt, selected_model_fullname)
+            st.markdown(report_md)
+            st.session_state.messages.append({"role": "assistant", "content": report_md})
 
-        st.markdown(report_md)
-        st.session_state.messages.append({"role": "assistant", "content": report_md})
-
-        st.download_button(
-            label=L["download_btn"],
-            data=report_md,
-            file_name="Business_Analysis_Report.md",
-            mime="text/markdown",
-            use_container_width=True
-        )
+            st.download_button(
+                label=L["download_btn"],
+                data=report_md,
+                file_name="Business_Analysis_Report.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+        except Exception as final_err:
+            st.error(f"보고서 생성 중 에러 발생: {final_err}")
