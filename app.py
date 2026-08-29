@@ -199,9 +199,21 @@ if st.sidebar.button(L["logout_btn"], use_container_width=True):
 st.sidebar.markdown("---")
 st.sidebar.header(L["ai_setting_header"])
 
+# 현재 API 키로 사용 가능한 모델 목록 동적 조회
+try:
+    available_models = [
+        m.name.replace("models/", "") 
+        for m in genai.list_models() 
+        if "generateContent" in m.supported_generation_methods
+    ]
+    if not available_models:
+        available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+except Exception:
+    available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+
 selected_model_name = st.sidebar.selectbox(
     L["model_select_label"],
-    ["models/gemini-1.5-pro", "models/gemini-1.5-flash", "models/gemini-2.0-flash"],
+    available_models,
     index=0
 )
 
@@ -417,6 +429,7 @@ if prompt := st.chat_input(L["input_placeholder"]):
 
         status.update(label=L["status_complete"], state="complete", expanded=False)
 
+        # 보고서 생성 및 자동 에러 복구 로직
         report_prompt = f"""
         {L['report_prompt_directive']}
 
@@ -431,12 +444,15 @@ if prompt := st.chat_input(L["input_placeholder"]):
 
         User Request: {prompt}
         """
+
         try:
             report_md = model.generate_content(report_prompt).text
         except Exception as e:
-            # NotFound 발생 시 기본 gemini-1.5-flash 모델로 재시도
-            fallback_model = genai.GenerativeModel('models/gemini-1.5-flash')
+            # 설정한 모델 호출 실패 시 지원 가능한 첫 번째 모델로 자동 전환
+            fallback_name = available_models[0] if available_models else "gemini-1.5-flash"
+            fallback_model = genai.GenerativeModel(fallback_name)
             report_md = fallback_model.generate_content(report_prompt).text
+
         st.markdown(report_md)
         st.session_state.messages.append({"role": "assistant", "content": report_md})
 
