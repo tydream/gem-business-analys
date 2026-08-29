@@ -308,6 +308,8 @@ def find_and_set_header(df_raw):
             unique_cols.append(col)
 
     df_clean.columns = unique_cols
+    # 실적이 없는 월/셀의 결측치(NaN)를 0으로 채워 연산 에러 방지
+    df_clean = df_clean.fillna(0)
     return df_clean
 
 def parse_folder_id(input_str):
@@ -333,7 +335,7 @@ def get_sheets_service():
     )
     return build('sheets', 'v4', credentials=creds)
 
-# [파이프라인 1] Google Sheets API v4 기반 다중 탭 동기화 파이프라인
+# [파이프라인 1] Google Sheets API v4 기반 다중 탭 동기화 및 누락 월 자동 보정 파이프라인
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     sheets_service = get_sheets_service()
@@ -366,7 +368,7 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
 
         try:
-            # 1. 순수 구글 시트 웹문서인 경우: Google Sheets API v4로 전 탭 직접 수집
+            # 1. 순수 구글 시트 웹문서인 경우
             if mime_type == 'application/vnd.google-apps.spreadsheet':
                 spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
                 sheets = spreadsheet.get('sheets', [])
@@ -473,11 +475,11 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     sql_prompt = f"""
     As an SQLite expert, generate ONLY a valid SQL query based strictly on the table schema and sample data below to answer the user request.
     
-    CRITICAL RULES:
-    1. ONLY use column names that explicitly appear in the schema below. Do NOT invent or assume columns that are not listed.
-    2. Do NOT use markdown code formatting like ```sql or explanations. Return pure SQL text only.
-    3. If querying transactional tables like 'Sorted' or 'Raw_Data', query 'country', 'Year', 'Model', 'Qty', and 'Amount' directly without unnecessary multi-table joins.
-    4. For string matching (e.g. country or model names), use UPPER() for case-insensitive comparisons.
+    CRITICAL RULES FOR MISSING MONTHS AND ROBUST QUERIES:
+    1. PREFER transactional tables like 'Sorted' or 'Raw_Data' whenever available! They have standard fixed columns ('country', 'Year', 'Month', 'Model', 'Qty', 'Amount') where missing months simply result in 0 rows and will NEVER throw a 'no such column' error.
+    2. Do NOT invent month columns (e.g. Y26_M01 or Y26_M09) that are not explicitly listed in the schema.
+    3. Do NOT use markdown code formatting like ```sql or explanations. Return pure SQL text only.
+    4. For string matching (e.g. country or model names), use UPPER() for case-insensitive comparisons (e.g. UPPER(country) = 'JAPAN').
 
     [Schema & Sample Data]
     {schema_info}
@@ -487,7 +489,41 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     sql_res = safe_generate_content(sql_prompt, selected_model_fullname).strip()
     clean_sql = sql_res.replace("```sql", "").replace("```", "").strip()
     
-    result_df = pd.read_sql_query(clean_sql, conn)
+    # SQL 실행 및 누락 월 컬럼 자동 복구(Schema Auto-Healing) 로직
+    try:
+        result_df = pd.read_sql_query(clean_sql, conn)
+    except sqlite3.OperationalError as sql_err:
+        err_str = str(sql_err)
+        # 특정 월 컬럼이 존재하지 않아 발생한 에러인지 감지 (예: no such column: Y26_M09 또는 no such column: T1.Y26_M01)
+        match = re.search(r"no such column:\s*(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)", err_str)
+        if match:
+            missing_col = match.group(1)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            all_tables = [r[0] for r in cursor.fetchall()]
+            
+            # DB 내 모든 테이블에 누락된 월 컬럼을 Default 0으로 동적 추가
+            for t_name in all_tables:
+                try:
+                    cursor.execute(f'ALTER TABLE "{t_name}" ADD COLUMN "{missing_col}" REAL DEFAULT 0;')
+                except Exception:
+                    pass
+            conn.commit()
+            
+            # 컬럼 자동 추가 후 SQL 재실행
+            try:
+                result_df = pd.read_sql_query(clean_sql, conn)
+            except Exception:
+                # 재실행도 실패할 경우 Gemini에게 스키마에 존재하는 컬럼으로 재작성 요청
+                fix_prompt = f"The SQL query '{clean_sql}' failed with error: {err_str}. Please rewrite a valid SQLite query using ONLY standard columns like country, Year, Month, Qty, Amount from 'Sorted' or 'Raw_Data' table:\n{schema_info}"
+                clean_sql = safe_generate_content(fix_prompt, selected_model_fullname).strip().replace("```sql", "").replace("```", "").strip()
+                result_df = pd.read_sql_query(clean_sql, conn)
+        else:
+            # 기타 SQL 문법 에러 시 재작성 시도
+            fix_prompt = f"The SQL query '{clean_sql}' failed with error: {err_str}. Please rewrite a valid SQLite query using ONLY standard columns from 'Sorted' or 'Raw_Data' table:\n{schema_info}"
+            clean_sql = safe_generate_content(fix_prompt, selected_model_fullname).strip().replace("```sql", "").replace("```", "").strip()
+            result_df = pd.read_sql_query(clean_sql, conn)
+
     return clean_sql, result_df.to_markdown(index=False)
 
 # [파이프라인 2] 문서 동기화 및 텍스트 추출
