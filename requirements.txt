@@ -4,8 +4,9 @@ pandas
 requests
 duckduckgo-search
 tabulate
-gdown
 pypdf
 python-docx
 openpyxl
 resend
+google-api-python-client
+google-auth
