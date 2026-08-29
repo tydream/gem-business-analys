@@ -2,7 +2,6 @@ import os
 import io
 import re
 import time
-import sqlite3
 import pandas as pd
 import streamlit as st
 import google.generativeai as genai
@@ -16,7 +15,6 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-DB_FILE = "users.db"
 OTP_EXPIRATION_SECONDS = 300
 
 st.set_page_config(page_title="통합 비즈니스 분석 Gem", page_icon="📈", layout="wide")
@@ -32,7 +30,7 @@ I18N = {
         "verify_otp_btn": "인증 및 로그인",
         "otp_input_label": "패스코드 6자리 입력",
         "reenter_email_btn": "이메일 다시 입력하기",
-        "not_registered_err": "등록되지 않은 사용자입니다. 마케팅 관리자에게 문의하세요.",
+        "not_registered_err": "등록되지 않은 사용자입니다. (관리자에게 Secrets 등록을 요청하세요)",
         "otp_sent_msg": "패스코드가 발송되었습니다. 이메일을 확인하세요.",
         "otp_expired_err": "패스코드 유효시간(5분)이 만료되었습니다.",
         "otp_mismatch_err": "패스코드가 일치하지 않습니다.",
@@ -46,11 +44,7 @@ I18N = {
         "admin_header": "🛠️ 마케터 전용 사용자 관리",
         "admin_key_label": "관리자 마스터키",
         "admin_auth_success": "관리자 인증됨",
-        "add_email_label": "추가할 이메일",
-        "add_user_btn": "사용자 등록",
-        "del_email_label": "삭제할 이메일",
-        "del_user_btn": "사용자 삭제",
-        "user_list_label": "등록된 사용자 목록:",
+        "user_list_label": "현재 영구 등록된 사용자 목록:",
         "app_caption": "현재 선택된 AI 모델",
         "input_placeholder": "분석 질문을 입력하세요 (예: 2025~2026년 8월 한국, 중국, 일본의 모델별 실판매 수량 비교표와 핵심 이슈를 종합 보고서로 작성해 줘)",
         "status_start": "통합 데이터 파이프라인 가동 중...",
@@ -71,7 +65,7 @@ I18N = {
         "verify_otp_btn": "Verify & Login",
         "otp_input_label": "Enter 6-digit Passcode",
         "reenter_email_btn": "Re-enter Email",
-        "not_registered_err": "Unregistered user. Please contact the administrator.",
+        "not_registered_err": "Unregistered user. Please ask the admin to add you in Secrets.",
         "otp_sent_msg": "Passcode sent. Please check your email inbox.",
         "otp_expired_err": "Passcode has expired (5-minute limit).",
         "otp_mismatch_err": "Passcode does not match.",
@@ -85,11 +79,7 @@ I18N = {
         "admin_header": "🛠️ Marketer Admin Console",
         "admin_key_label": "Admin Master Key",
         "admin_auth_success": "Admin Authorized",
-        "add_email_label": "Email to Add",
-        "add_user_btn": "Register User",
-        "del_email_label": "Email to Delete",
-        "del_user_btn": "Delete User",
-        "user_list_label": "Registered User List:",
+        "user_list_label": "Permanently Registered Users:",
         "app_caption": "Active AI Model",
         "input_placeholder": "Enter analysis query (e.g., Create a sales performance table and key issue report for Korea, China, and Japan by model from 2025 to Aug 2026)",
         "status_start": "Running integrated data pipeline...",
@@ -103,57 +93,6 @@ I18N = {
     }
 }
 
-# SQLite 초기화 및 사용자 관리
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def is_registered_user(email: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT email FROM users WHERE email = ?", (email.strip(),))
-    user = cursor.fetchone()
-    conn.close()
-    return user is not None
-
-def add_user_to_db(email: str) -> bool:
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (email) VALUES (?)", (email.strip(),))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-def delete_user_from_db(email: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE email = ?", (email.strip(),))
-    rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return rows > 0
-
-def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT email, created_at FROM users")
-    users = cursor.fetchall()
-    conn.close()
-    return users
-
 # 서버 설정값(Secrets) 로드
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -162,11 +101,19 @@ try:
     RESEND_API_KEY = st.secrets["RESEND_API_KEY"]
     ADMIN_MASTER_KEY = st.secrets["ADMIN_MASTER_KEY"]
     
+    # Secrets에서 ALLOWED_EMAILS를 가져와 리스트로 변환 (공백 제거)
+    raw_emails = st.secrets.get("ALLOWED_EMAILS", "")
+    ALLOWED_USER_LIST = [e.strip() for e in raw_emails.split(",") if e.strip()]
+    
     # GCP 서비스 계정 정보 로드
     gcp_credentials = dict(st.secrets["gcp_service_account"])
 except Exception as e:
     st.error("시스템 설정(Secrets)이 올바르게 완료되지 않았습니다.")
     st.stop()
+
+# 등록된 사용자인지 Secrets를 기준으로 검사
+def is_registered_user(email: str) -> bool:
+    return email.strip() in ALLOWED_USER_LIST
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -174,25 +121,20 @@ genai.configure(api_key=GEMINI_API_KEY)
 selected_lang = st.sidebar.radio("🌐 Language / 언어 선택", ["한국어", "English"], index=0)
 L = I18N[selected_lang]
 
-# 2. 사이드바 - 마케터 전용 사용자 관리
+# 2. 사이드바 - 마케터 전용 사용자 관리 (Secrets에 등록된 영구 명단 확인용)
 st.sidebar.markdown("---")
 with st.sidebar.expander(L["admin_header"]):
     admin_key_input = st.text_input(L["admin_key_label"], type="password")
     if admin_key_input == ADMIN_MASTER_KEY:
         st.success(L["admin_auth_success"])
-        new_user_email = st.text_input(L["add_email_label"])
-        if st.button(L["add_user_btn"]):
-            if add_user_to_db(new_user_email): st.success("Success!")
-            else: st.error("Failed!")
-                
-        del_user_email = st.text_input(L["del_email_label"])
-        if st.button(L["del_user_btn"]):
-            if delete_user_from_db(del_user_email): st.success("Success!")
-            else: st.error("Failed!")
-                
         st.markdown(f"**{L['user_list_label']}**")
-        for u in get_all_users():
-            st.text(f"- {u[0]}")
+        if ALLOWED_USER_LIST:
+            for u in ALLOWED_USER_LIST:
+                st.text(f"- {u}")
+        else:
+            st.text("등록된 사용자가 없습니다. Secrets에 ALLOWED_EMAILS를 추가하세요.")
+        
+        st.info("💡 사용자를 추가/삭제하려면 Streamlit Cloud의 [Settings] -> [Secrets] 메뉴에서 ALLOWED_EMAILS 항목을 수정하세요.")
 
 # 3. 로그인 화면 처리
 def login_screen():
@@ -213,7 +155,8 @@ def login_screen():
                         st.error(L["not_registered_err"])
                     else:
                         otp_code = generate_otp()
-                        if send_otp_email(RESEND_API_KEY, email, otp_code):
+                        is_success, err_msg = send_otp_email(RESEND_API_KEY, email, otp_code)
+                        if is_success:
                             st.session_state["otp_sent"] = True
                             st.session_state["target_email"] = email
                             st.session_state["generated_otp"] = otp_code
@@ -221,7 +164,7 @@ def login_screen():
                             st.success(L["otp_sent_msg"])
                             st.rerun()
                         else:
-                            st.error("Email delivery failed.")
+                            st.error(f"메일 발송 실패: {err_msg}")
         else:
             st.info(f"**{st.session_state['target_email']}**")
             with st.form("verify_otp"):
@@ -290,6 +233,12 @@ st.caption(f"{L['app_caption']}: **{selected_model_name}** (Temp: {temperature_v
 # Google Drive API (서비스 계정 연동 파이프라인)
 # ========================================================
 
+def parse_folder_id(input_str):
+    if "drive.google.com" in input_str:
+        match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
+        if match: return match.group(1)
+    return input_str.strip()
+
 def get_drive_service():
     creds = service_account.Credentials.from_service_account_info(
         gcp_credentials,
@@ -302,7 +251,6 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     query = f"'{folder_id.strip()}' in parents and trashed = false"
     
-    # 공유드라이브를 위한 API 옵션 설정
     results = drive_service.files().list(
         q=query,
         supportsAllDrives=True,
