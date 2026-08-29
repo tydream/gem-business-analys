@@ -431,7 +431,12 @@ if prompt := st.chat_input(L["input_placeholder"]):
 
         User Request: {prompt}
         """
-        report_md = model.generate_content(report_prompt).text
+        try:
+            report_md = model.generate_content(report_prompt).text
+        except Exception as e:
+            # NotFound 발생 시 기본 gemini-1.5-flash 모델로 재시도
+            fallback_model = genai.GenerativeModel('models/gemini-1.5-flash')
+            report_md = fallback_model.generate_content(report_prompt).text
         st.markdown(report_md)
         st.session_state.messages.append({"role": "assistant", "content": report_md})
 
