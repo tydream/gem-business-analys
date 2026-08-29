@@ -260,10 +260,29 @@ st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature_val})")
 
 # ========================================================
-# 동적 헤더 탐색 및 Google Sheets API v4 파이프라인
+# SQL 정제, 컬럼 표준화 및 Google Sheets API v4 파이프라인
 # ========================================================
 
+def sanitize_sql(sql_str):
+    """생성된 SQL 문장의 미완성 구문, 잘린 괄호/따옴표를 정제하는 함수"""
+    sql = sql_str.replace("```sql", "").replace("```", "").strip()
+    if sql.endswith(";"):
+        sql = sql[:-1].strip()
+    
+    if sql.count("'") % 2 != 0:
+        sql += "'"
+    if sql.count('"') % 2 != 0:
+        sql += '"'
+        
+    open_p = sql.count("(")
+    close_p = sql.count(")")
+    if open_p > close_p:
+        sql += ")" * (open_p - close_p)
+        
+    return sql
+
 def find_and_set_header(df_raw):
+    """최적의 헤더 탐색 및 정제"""
     if df_raw.empty:
         return df_raw
 
@@ -308,9 +327,47 @@ def find_and_set_header(df_raw):
             unique_cols.append(col)
 
     df_clean.columns = unique_cols
-    # 실적이 없는 월/셀의 결측치(NaN)를 0으로 채워 연산 에러 방지
     df_clean = df_clean.fillna(0)
     return df_clean
+
+def standardize_columns_for_domain(df, file_name, tab_name):
+    """
+    Sales(수출)와 Activation(실판매) 간 양식 차이로 인한 의미 전달 오류 방지 함수
+    - Activation 데이터에 수량 컬럼(Qty = 1) 자동 가상 추가
+    - 날짜, 국가 표준 컬럼(Year, Month, country) 별칭 자동 생성
+    """
+    if df.empty:
+        return df, "UNKNOWN"
+
+    is_activation = any(k in f"{file_name}_{tab_name}".lower() for k in ['activ', 'activation'])
+    is_sales = any(k in f"{file_name}_{tab_name}".lower() for k in ['sale', 'sales', 'shipment', 'so'])
+    domain = "ACTIVATION (Actual User Registrations)" if is_activation else ("SALES (Export/Shipments)" if is_sales else "GENERAL")
+
+    cols_lower = [str(c).lower() for c in df.columns]
+
+    # 1. Activation 파일 전처리: 원천 레코드(1행 = 1대)일 경우 Qty 수량 컬럼 보완
+    if is_activation:
+        if 'qty' not in cols_lower:
+            df['Qty'] = 1  # 1행당 1대 개통 수량 자동 할당
+        
+        # 날짜 컬럼 표준화
+        if 'created_year' in cols_lower and 'year' not in cols_lower:
+            match_col = df.columns[cols_lower.index('created_year')]
+            df['Year'] = df[match_col]
+        if 'created_month' in cols_lower and 'month' not in cols_lower:
+            match_col = df.columns[cols_lower.index('created_month')]
+            df['Month'] = df[match_col]
+            
+        # 국가 컬럼 표준화
+        if 'country_renamed' in cols_lower and 'country' not in cols_lower:
+            match_col = df.columns[cols_lower.index('country_renamed')]
+            df['country'] = df[match_col]
+
+    # 2. Sales 파일 전처리: country 소문자/대문자 동기화
+    if 'country' not in df.columns and 'Country' in df.columns:
+        df['country'] = df['Country']
+
+    return df, domain
 
 def parse_folder_id(input_str):
     if "drive.google.com" in input_str:
@@ -335,7 +392,7 @@ def get_sheets_service():
     )
     return build('sheets', 'v4', credentials=creds)
 
-# [파이프라인 1] Google Sheets API v4 기반 다중 탭 동기화 및 누락 월 자동 보정 파이프라인
+# [파이프라인 1] Google Sheets API v4 동기화 및 스마트 도메인 분리 SQL/Pandas 추출
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     sheets_service = get_sheets_service()
@@ -358,6 +415,7 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
 
     conn = sqlite3.connect(':memory:')
     loaded_tables = []
+    loaded_dfs = {}
     table_index = 1
     fetch_errors = []
 
@@ -368,7 +426,7 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
 
         try:
-            # 1. 순수 구글 시트 웹문서인 경우
+            # 1. 순수 구글 시트 웹문서
             if mime_type == 'application/vnd.google-apps.spreadsheet':
                 spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
                 sheets = spreadsheet.get('sheets', [])
@@ -392,12 +450,16 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                     if df.empty or len(df.columns) == 0:
                         continue
 
+                    # Sales vs Activation 의미 정제 및 컬럼 표준화 적용
+                    df, domain_label = standardize_columns_for_domain(df, file_name, tab_name)
+
                     df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    loaded_dfs[table_name] = df
                     cols = ", ".join(df.columns.tolist())
                     sample_data = df.head(2).to_dict(orient='records')
                     
                     loaded_tables.append(
-                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
+                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name}) [DOMAIN: {domain_label}]\n"
                         f"  Columns: {cols}\n"
                         f"  Sample Data: {sample_data}"
                     )
@@ -425,12 +487,15 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                     if df.empty or len(df.columns) == 0:
                         continue
 
+                    df, domain_label = standardize_columns_for_domain(df, file_name, tab_name)
+
                     df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    loaded_dfs[table_name] = df
                     cols = ", ".join(df.columns.tolist())
                     sample_data = df.head(2).to_dict(orient='records')
                     
                     loaded_tables.append(
-                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
+                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name}) [DOMAIN: {domain_label}]\n"
                         f"  Columns: {cols}\n"
                         f"  Sample Data: {sample_data}"
                     )
@@ -450,12 +515,14 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 table_name = f"data_{table_index}_{file_name_clean[:20]}"
                 df = find_and_set_header(df_raw)
                 if not df.empty and len(df.columns) > 0:
+                    df, domain_label = standardize_columns_for_domain(df, file_name, "Main")
                     df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    loaded_dfs[table_name] = df
                     cols = ", ".join(df.columns.tolist())
                     sample_data = df.head(2).to_dict(orient='records')
                     
                     loaded_tables.append(
-                        f"- Table [{table_name}] (File: {file_name})\n"
+                        f"- Table [{table_name}] (File: {file_name}) [DOMAIN: {domain_label}]\n"
                         f"  Columns: {cols}\n"
                         f"  Sample Data: {sample_data}"
                     )
@@ -473,58 +540,60 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
 
     schema_info = "\n\n".join(loaded_tables)
     sql_prompt = f"""
-    As an SQLite expert, generate ONLY a valid SQL query based strictly on the table schema and sample data below to answer the user request.
+    As an SQLite expert, generate ONLY a single, COMPLETE, valid SQL query based strictly on the table schema and sample data below.
     
-    CRITICAL RULES FOR MISSING MONTHS AND ROBUST QUERIES:
-    1. PREFER transactional tables like 'Sorted' or 'Raw_Data' whenever available! They have standard fixed columns ('country', 'Year', 'Month', 'Model', 'Qty', 'Amount') where missing months simply result in 0 rows and will NEVER throw a 'no such column' error.
-    2. Do NOT invent month columns (e.g. Y26_M01 or Y26_M09) that are not explicitly listed in the schema.
-    3. Do NOT use markdown code formatting like ```sql or explanations. Return pure SQL text only.
-    4. For string matching (e.g. country or model names), use UPPER() for case-insensitive comparisons (e.g. UPPER(country) = 'JAPAN').
+    CRITICAL DOMAIN & COLUMN MAPPING RULES:
+    1. EXPORT/SHIPMENT DATA = Tables with 'Device_Sales' in name. Quantities are measured by SUM(Qty).
+    2. ACTUAL USER ACTIVATION DATA = Tables with 'Device_Activ' in name. Quantities are measured by SUM(Qty) or COUNT(*).
+    3. SUMMARY TABLES COLUMN DIFFERENCES:
+       - Sales Summary Monthly Columns: 'Y26_M01', 'Y26_M02' ... 'Grand_Total'
+       - Activation Summary Monthly Columns: '26_01', '26_02' ... '총계' (or '2026')
+    4. PREFER querying transactional tables like 'Sorted' or 'Raw_Data' directly (e.g. SELECT Model, SUM(Qty) FROM table WHERE UPPER(country) = 'JAPAN' AND Year = 2026 GROUP BY Model) as they have unified columns ('country', 'Year', 'Month', 'Model', 'Qty').
+    5. Do NOT perform multi-table JOINs across Sales and Activation tables if their column formats differ. Generate separate simple SELECT queries or query transactional tables independently.
+    6. Return pure SQL text only without markdown backticks.
 
     [Schema & Sample Data]
     {schema_info}
     
     Request: {user_prompt}
     """
-    sql_res = safe_generate_content(sql_prompt, selected_model_fullname).strip()
-    clean_sql = sql_res.replace("```sql", "").replace("```", "").strip()
+    raw_sql = safe_generate_content(sql_prompt, selected_model_fullname)
+    clean_sql = sanitize_sql(raw_sql)
     
-    # SQL 실행 및 누락 월 컬럼 자동 복구(Schema Auto-Healing) 로직
+    # SQL 실행 및 스마트 Fallback 처리
     try:
         result_df = pd.read_sql_query(clean_sql, conn)
-    except sqlite3.OperationalError as sql_err:
-        err_str = str(sql_err)
-        # 특정 월 컬럼이 존재하지 않아 발생한 에러인지 감지 (예: no such column: Y26_M09 또는 no such column: T1.Y26_M01)
-        match = re.search(r"no such column:\s*(?:[A-Za-z0-9_]+\.)?([A-Za-z0-9_]+)", err_str)
-        if match:
-            missing_col = match.group(1)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            all_tables = [r[0] for r in cursor.fetchall()]
+        return clean_sql, result_df.to_markdown(index=False)
+    except Exception as sql_err:
+        err_msg = str(sql_err)
+        try:
+            fix_prompt = f"""
+            The previous SQLite query failed with error: '{err_msg}'.
+            Generate a VERY SIMPLE, SINGLE-TABLE SQLite query for table containing 'Sorted' or 'Raw_Data' to answer: {user_prompt}
+            Ensure pure SQL text only, no code blocks, fully complete.
             
-            # DB 내 모든 테이블에 누락된 월 컬럼을 Default 0으로 동적 추가
-            for t_name in all_tables:
-                try:
-                    cursor.execute(f'ALTER TABLE "{t_name}" ADD COLUMN "{missing_col}" REAL DEFAULT 0;')
-                except Exception:
-                    pass
-            conn.commit()
+            [Schema]
+            {schema_info}
+            """
+            fixed_sql = sanitize_sql(safe_generate_content(fix_prompt, selected_model_fullname))
+            result_df = pd.read_sql_query(fixed_sql, conn)
+            return fixed_sql, result_df.to_markdown(index=False)
+        except Exception:
+            fallback_markdowns = []
+            for t_name, df_t in loaded_dfs.items():
+                if any(k in t_name for k in ['Sorted', 'Raw_Data', 'ModelQtyY', 'ModelY']):
+                    country_col = next((c for c in df_t.columns if 'country' in str(c).lower()), None)
+                    if country_col:
+                        mask = df_t[country_col].astype(str).str.upper().str.contains('JAPAN|KOREA|CHINA|USA', regex=True, na=False)
+                        filtered = df_t[mask]
+                        if not filtered.empty:
+                            fallback_markdowns.append(f"### [Direct Extracted Data: {t_name}]\n" + filtered.head(15).to_markdown(index=False))
             
-            # 컬럼 자동 추가 후 SQL 재실행
-            try:
-                result_df = pd.read_sql_query(clean_sql, conn)
-            except Exception:
-                # 재실행도 실패할 경우 Gemini에게 스키마에 존재하는 컬럼으로 재작성 요청
-                fix_prompt = f"The SQL query '{clean_sql}' failed with error: {err_str}. Please rewrite a valid SQLite query using ONLY standard columns like country, Year, Month, Qty, Amount from 'Sorted' or 'Raw_Data' table:\n{schema_info}"
-                clean_sql = safe_generate_content(fix_prompt, selected_model_fullname).strip().replace("```sql", "").replace("```", "").strip()
-                result_df = pd.read_sql_query(clean_sql, conn)
-        else:
-            # 기타 SQL 문법 에러 시 재작성 시도
-            fix_prompt = f"The SQL query '{clean_sql}' failed with error: {err_str}. Please rewrite a valid SQLite query using ONLY standard columns from 'Sorted' or 'Raw_Data' table:\n{schema_info}"
-            clean_sql = safe_generate_content(fix_prompt, selected_model_fullname).strip().replace("```sql", "").replace("```", "").strip()
-            result_df = pd.read_sql_query(clean_sql, conn)
-
-    return clean_sql, result_df.to_markdown(index=False)
+            if fallback_markdowns:
+                return "Pandas Direct Extraction (SQL Bypass)", "\n\n".join(fallback_markdowns)
+            else:
+                first_df = list(loaded_dfs.values())[0]
+                return "Pandas Direct Summary (SQL Bypass)", first_df.head(10).to_markdown(index=False)
 
 # [파이프라인 2] 문서 동기화 및 텍스트 추출
 def fetch_and_extract_multi_docs(folder_id, user_prompt):
