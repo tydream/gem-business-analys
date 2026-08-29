@@ -1,0 +1,11 @@
+streamlit
+google-generativeai
+pandas
+requests
+duckduckgo-search
+tabulate
+gdown
+pypdf
+python-docx
+openpyxl
+resend
