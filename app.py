@@ -242,7 +242,6 @@ generation_config = genai.GenerationConfig(
     max_output_tokens=8192
 )
 
-# 안전한 Gemini 콘텐츠 생성 래퍼 함수 (예외 시 대체 모델 순회)
 def safe_generate_content(prompt_text, preferred_model_name):
     target_models = [preferred_model_name] + [m for m in VALID_MODELS if m != preferred_model_name]
     last_error = None
@@ -270,9 +269,6 @@ st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature
 # ========================================================
 
 def find_and_set_header(df_raw):
-    """
-    상위 행들을 스캔하여 가장 적합한 헤더(열 이름) 행을 자동으로 탐색하여 지정하는 함수
-    """
     if df_raw.empty:
         return df_raw
 
@@ -332,7 +328,7 @@ def get_drive_service():
     )
     return build('drive', 'v3', credentials=creds)
 
-# [파이프라인 1] 다중 시트 및 복수 탭(Worksheet) 동기화 파이프라인
+# [파이프라인 1] 다중 시트 및 대용량 파일 우회 처리 파이프라인
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
     clean_folder_id = parse_folder_id(folder_id)
@@ -347,10 +343,10 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         ).execute()
         files = results.get('files', [])
     except Exception as list_err:
-        raise Exception(f"구글 드라이브 폴더 조회 실패 (폴더 ID 및 서비스 계정 권한 확인 필요): {list_err}")
+        raise Exception(f"구글 드라이브 폴더 조회 실패: {list_err}")
 
     if not files:
-        raise Exception(f"지정한 폴더(ID: {clean_folder_id}) 내에 접근 가능한 파일이 없습니다. 서비스 계정이 해당 폴더에 '뷰어'로 추가되어 있는지 확인하세요.")
+        raise Exception(f"지정한 폴더(ID: {clean_folder_id}) 내에 접근 가능한 파일이 없습니다.")
 
     conn = sqlite3.connect(':memory:')
     loaded_tables = []
@@ -366,16 +362,28 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         try:
             fh = io.BytesIO()
 
-            # 1. 순수 구글 시트 (Google Sheets 웹문서): 모든 탭을 파싱하기 위해 XLSX로 내보내기
+            # 1. 순수 구글 시트 (Google Sheets 웹문서)
             if mime_type == 'application/vnd.google-apps.spreadsheet':
-                export_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-                fh.seek(0)
-                sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
+                try:
+                    # 1차 시도: 모든 탭 파싱을 위해 XLSX 포맷 내보내기
+                    export_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    fh.seek(0)
+                    sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
+                except Exception:
+                    # 2차 시도 (대용량 우회): XLSX 용량 제한 초과 시 CSV 다운로드로 전환
+                    fh = io.BytesIO()
+                    request = drive_service.files().export_media(fileId=file_id, mimeType='text/csv')
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    fh.seek(0)
+                    sheets_dict = {"Main": pd.read_csv(fh, header=None)}
 
             # 2. 업로드된 엑셀 파일 (.xlsx, .xls)
             elif file_name.lower().endswith(('.xlsx', '.xls')) or 'excel' in mime_type:
