@@ -217,7 +217,7 @@ def login_screen():
                             st.success(L["otp_sent_msg"])
                             st.rerun()
                         else:
-                            st.error("Email delivery failed.")
+                            st.error(f"Email delivery failed. (Check Resend API Key or recipient email restriction)")
         else:
             st.info(f"**{st.session_state['target_email']}**")
             with st.form("verify_otp"):
