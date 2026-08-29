@@ -105,7 +105,6 @@ try:
     raw_emails = st.secrets.get("ALLOWED_EMAILS", "")
     ALLOWED_USER_LIST = [e.strip() for e in raw_emails.split(",") if e.strip()]
     
-    # GCP 서비스 계정 정보 로드 및 private_key 줄바꿈 보정
     gcp_credentials = dict(st.secrets["gcp_service_account"])
     if "private_key" in gcp_credentials:
         gcp_credentials["private_key"] = gcp_credentials["private_key"].replace("\\n", "\n")
@@ -116,7 +115,7 @@ except Exception as e:
 def is_registered_user(email: str) -> bool:
     return email.strip() in ALLOWED_USER_LIST
 
-# Gemini API 설정 및 사용 가능한 모델 동적 검색
+# Gemini API 설정
 genai.configure(api_key=GEMINI_API_KEY)
 
 def get_valid_model_list():
@@ -133,11 +132,9 @@ def get_valid_model_list():
 
 VALID_MODELS = get_valid_model_list()
 
-# 1. 사이드바 - 언어 선택
 selected_lang = st.sidebar.radio("🌐 Language / 언어 선택", ["한국어", "English"], index=0)
 L = I18N[selected_lang]
 
-# 2. 사이드바 - 마케터 전용 사용자 관리
 st.sidebar.markdown("---")
 with st.sidebar.expander(L["admin_header"]):
     admin_key_input = st.text_input(L["admin_key_label"], type="password")
@@ -150,7 +147,6 @@ with st.sidebar.expander(L["admin_header"]):
         else:
             st.text("등록된 사용자가 없습니다. Secrets에 ALLOWED_EMAILS를 추가하세요.")
 
-# 3. 로그인 화면 처리
 def login_screen():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -203,7 +199,6 @@ if not st.session_state.get("authenticated", False):
     login_screen()
     st.stop()
 
-# 4. 로그인 성공 후 추가되는 사이드바 및 AI 설정
 st.sidebar.title(L["account_info"])
 st.sidebar.write(f"{L['current_user']}: **{st.session_state['user_email']}**")
 if st.sidebar.button(L["logout_btn"], use_container_width=True):
@@ -265,7 +260,7 @@ st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature_val})")
 
 # ========================================================
-# 동적 헤더 탐색 및 구글 드라이브 API 연동 파이프라인
+# Google Sheets API v4 전용 다중 탭 동기화 파이프라인
 # ========================================================
 
 def find_and_set_header(df_raw):
@@ -328,9 +323,20 @@ def get_drive_service():
     )
     return build('drive', 'v3', credentials=creds)
 
-# [파이프라인 1] 다중 시트 및 대용량 파일 우회 처리 파이프라인
+def get_sheets_service():
+    creds = service_account.Credentials.from_service_account_info(
+        gcp_credentials,
+        scopes=[
+            'https://www.googleapis.com/auth/drive.readonly',
+            'https://www.googleapis.com/auth/spreadsheets.readonly'
+        ]
+    )
+    return build('sheets', 'v4', credentials=creds)
+
+# [파이프라인 1] Google Sheets API v4 기반 다중 탭 동기화 파이프라인
 def fetch_and_load_multiple_sheets(folder_id, user_prompt):
     drive_service = get_drive_service()
+    sheets_service = get_sheets_service()
     clean_folder_id = parse_folder_id(folder_id)
     query = f"'{clean_folder_id}' in parents and trashed = false"
     
@@ -360,33 +366,44 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
         file_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(file_name)[0])
 
         try:
-            fh = io.BytesIO()
-
-            # 1. 순수 구글 시트 (Google Sheets 웹문서)
+            # 1. 순수 구글 시트 웹문서인 경우: Google Sheets API v4로 전 탭 직접 수집
             if mime_type == 'application/vnd.google-apps.spreadsheet':
-                try:
-                    # 1차 시도: 모든 탭 파싱을 위해 XLSX 포맷 내보내기
-                    export_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                    request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime)
-                    downloader = MediaIoBaseDownload(fh, request)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-                    fh.seek(0)
-                    sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
-                except Exception:
-                    # 2차 시도 (대용량 우회): XLSX 용량 제한 초과 시 CSV 다운로드로 전환
-                    fh = io.BytesIO()
-                    request = drive_service.files().export_media(fileId=file_id, mimeType='text/csv')
-                    downloader = MediaIoBaseDownload(fh, request)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-                    fh.seek(0)
-                    sheets_dict = {"Main": pd.read_csv(fh, header=None)}
+                spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
+                sheets = spreadsheet.get('sheets', [])
+                
+                for sheet in sheets:
+                    tab_name = sheet['properties']['title']
+                    val_res = sheets_service.spreadsheets().values().get(
+                        spreadsheetId=file_id,
+                        range=f"'{tab_name}'"
+                    ).execute()
+                    rows = val_res.get('values', [])
+                    
+                    if not rows:
+                        continue
+                    
+                    df_raw = pd.DataFrame(rows)
+                    tab_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(tab_name))
+                    table_name = f"data_{table_index}_{file_name_clean[:12]}_{tab_name_clean[:10]}"
+
+                    df = find_and_set_header(df_raw)
+                    if df.empty or len(df.columns) == 0:
+                        continue
+
+                    df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    cols = ", ".join(df.columns.tolist())
+                    sample_data = df.head(2).to_dict(orient='records')
+                    
+                    loaded_tables.append(
+                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
+                        f"  Columns: {cols}\n"
+                        f"  Sample Data: {sample_data}"
+                    )
+                    table_index += 1
 
             # 2. 업로드된 엑셀 파일 (.xlsx, .xls)
             elif file_name.lower().endswith(('.xlsx', '.xls')) or 'excel' in mime_type:
+                fh = io.BytesIO()
                 request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
                 downloader = MediaIoBaseDownload(fh, request)
                 done = False
@@ -395,40 +412,52 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
                 fh.seek(0)
                 sheets_dict = pd.read_excel(fh, sheet_name=None, header=None)
 
+                for tab_name, df_raw in sheets_dict.items():
+                    if df_raw.empty:
+                        continue
+
+                    tab_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(tab_name))
+                    table_name = f"data_{table_index}_{file_name_clean[:12]}_{tab_name_clean[:10]}"
+
+                    df = find_and_set_header(df_raw)
+                    if df.empty or len(df.columns) == 0:
+                        continue
+
+                    df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    cols = ", ".join(df.columns.tolist())
+                    sample_data = df.head(2).to_dict(orient='records')
+                    
+                    loaded_tables.append(
+                        f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
+                        f"  Columns: {cols}\n"
+                        f"  Sample Data: {sample_data}"
+                    )
+                    table_index += 1
+
             # 3. 업로드된 CSV 파일 (.csv)
             elif file_name.lower().endswith('.csv') or mime_type == 'text/csv':
+                fh = io.BytesIO()
                 request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
                 downloader = MediaIoBaseDownload(fh, request)
                 done = False
                 while not done:
                     _, done = downloader.next_chunk()
                 fh.seek(0)
-                sheets_dict = {"Main": pd.read_csv(fh, header=None)}
-            else:
-                continue
+                df_raw = pd.read_csv(fh, header=None)
 
-            for tab_name, df_raw in sheets_dict.items():
-                if df_raw.empty:
-                    continue
-
-                tab_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(tab_name))
-                table_name = f"data_{table_index}_{file_name_clean[:12]}_{tab_name_clean[:10]}"
-
+                table_name = f"data_{table_index}_{file_name_clean[:20]}"
                 df = find_and_set_header(df_raw)
-
-                if df.empty or len(df.columns) == 0:
-                    continue
-
-                df.to_sql(table_name, conn, index=False, if_exists='replace')
-                cols = ", ".join(df.columns.tolist())
-                sample_data = df.head(2).to_dict(orient='records')
-                
-                loaded_tables.append(
-                    f"- Table [{table_name}] (File: {file_name} / Tab: {tab_name})\n"
-                    f"  Columns: {cols}\n"
-                    f"  Sample Data: {sample_data}"
-                )
-                table_index += 1
+                if not df.empty and len(df.columns) > 0:
+                    df.to_sql(table_name, conn, index=False, if_exists='replace')
+                    cols = ", ".join(df.columns.tolist())
+                    sample_data = df.head(2).to_dict(orient='records')
+                    
+                    loaded_tables.append(
+                        f"- Table [{table_name}] (File: {file_name})\n"
+                        f"  Columns: {cols}\n"
+                        f"  Sample Data: {sample_data}"
+                    )
+                    table_index += 1
 
         except Exception as file_err:
             fetch_errors.append(f"[{file_name}] 읽기 실패: {file_err}")
