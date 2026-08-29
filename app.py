@@ -260,7 +260,7 @@ st.title(L["page_title"])
 st.caption(f"{L['app_caption']}: **{selected_display_name}** (Temp: {temperature_val})")
 
 # ========================================================
-# Google Sheets API v4 전용 다중 탭 동기화 파이프라인
+# 동적 헤더 탐색 및 Google Sheets API v4 파이프라인
 # ========================================================
 
 def find_and_set_header(df_raw):
@@ -471,9 +471,14 @@ def fetch_and_load_multiple_sheets(folder_id, user_prompt):
 
     schema_info = "\n\n".join(loaded_tables)
     sql_prompt = f"""
-    As an SQLite expert, generate ONLY a valid SQL query based on the table schema and sample data below to answer the user request.
-    Do NOT include markdown formatting like ```sql or explanations. Return pure SQL text only.
+    As an SQLite expert, generate ONLY a valid SQL query based strictly on the table schema and sample data below to answer the user request.
     
+    CRITICAL RULES:
+    1. ONLY use column names that explicitly appear in the schema below. Do NOT invent or assume columns that are not listed.
+    2. Do NOT use markdown code formatting like ```sql or explanations. Return pure SQL text only.
+    3. If querying transactional tables like 'Sorted' or 'Raw_Data', query 'country', 'Year', 'Model', 'Qty', and 'Amount' directly without unnecessary multi-table joins.
+    4. For string matching (e.g. country or model names), use UPPER() for case-insensitive comparisons.
+
     [Schema & Sample Data]
     {schema_info}
     
