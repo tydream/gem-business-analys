@@ -201,7 +201,7 @@ st.sidebar.header(L["ai_setting_header"])
 
 selected_model_name = st.sidebar.selectbox(
     L["model_select_label"],
-    ["gemini-1.5-pro", "gemini-1.5-flash"],
+    ["models/gemini-1.5-pro", "models/gemini-1.5-flash", "models/gemini-2.0-flash"],
     index=0
 )
 
